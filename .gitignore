@@ -26,6 +26,13 @@ build/
 .coverage
 htmlcov/
 
+# ── Node / Frontend ───────────────────────────────────────────────
+node_modules/
+.vite/
+dist/
+build/
+*.tsbuildinfo
+
 # ── IDEs ──────────────────────────────────────────────────────────
 .vscode/
 .idea/
