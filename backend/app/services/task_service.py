@@ -21,6 +21,32 @@ from app.schemas.task import RepoTaskRequest, TaskRequest, TaskResponse
 # ── Model ──────────────────────────────────────────────────────────
 GEMINI_MODEL = "gemini-3.8-flash"
 
+# ── In-Memory Task Registry ─────────────────────────────────────────
+
+_TASK_REGISTRY: dict[str, TaskResponse] = {}
+
+
+def save_task(task: TaskResponse) -> TaskResponse:
+    """Stores a generated task in the in-memory registry."""
+    _TASK_REGISTRY[task.id] = task
+    return task
+
+
+def get_task(task_id: str) -> TaskResponse | None:
+    """Retrieves a task by UUID from the in-memory registry."""
+    return _TASK_REGISTRY.get(task_id)
+
+
+def list_tasks() -> list[TaskResponse]:
+    """Lists all stored tasks."""
+    return list(_TASK_REGISTRY.values())
+
+
+def clear_tasks() -> None:
+    """Clears the in-memory task registry (for test isolation)."""
+    _TASK_REGISTRY.clear()
+
+
 # ── Prompt templates ───────────────────────────────────────────────
 _TOPIC_PROMPT = """\
 You are a senior software engineering task designer for a professional coding education platform.
@@ -161,17 +187,19 @@ def generate_task(request: TaskRequest) -> TaskResponse:
         )
 
     # ── Build validated response ───────────────────────────────────
-    return TaskResponse(
-        id=str(uuid.uuid4()),
-        topic=request.topic,
-        difficulty=request.difficulty,
-        language=request.language,
-        category=request.category,
-        generated_at=datetime.now(timezone.utc).isoformat(),
-        title=raw["title"],
-        description=raw["description"],
-        requirements=raw["requirements"],
-        acceptance_criteria=raw["acceptance_criteria"],
+    return save_task(
+        TaskResponse(
+            id=str(uuid.uuid4()),
+            topic=request.topic,
+            difficulty=request.difficulty,
+            language=request.language,
+            category=request.category,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            title=raw["title"],
+            description=raw["description"],
+            requirements=raw["requirements"],
+            acceptance_criteria=raw["acceptance_criteria"],
+        )
     )
 
 
@@ -257,18 +285,20 @@ def generate_task_from_repo(
     if opts.focus_area:
         topic_summary += f" ({opts.focus_area})"
 
-    return TaskResponse(
-        id=str(uuid.uuid4()),
-        topic=topic_summary,
-        difficulty=opts.difficulty,
-        language=primary_lang,
-        category=category,
-        generated_at=datetime.now(timezone.utc).isoformat(),
-        title=raw["title"],
-        description=raw["description"],
-        requirements=raw["requirements"],
-        acceptance_criteria=raw["acceptance_criteria"],
-        project_name=repo_analysis.project_name,
-        relevant_files=relevant_files,
-        starting_commit_sha=repo_analysis.commit_sha,
+    return save_task(
+        TaskResponse(
+            id=str(uuid.uuid4()),
+            topic=topic_summary,
+            difficulty=opts.difficulty,
+            language=primary_lang,
+            category=category,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            title=raw["title"],
+            description=raw["description"],
+            requirements=raw["requirements"],
+            acceptance_criteria=raw["acceptance_criteria"],
+            project_name=repo_analysis.project_name,
+            relevant_files=relevant_files,
+            starting_commit_sha=repo_analysis.commit_sha,
+        )
     )
