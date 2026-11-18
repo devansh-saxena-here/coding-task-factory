@@ -170,16 +170,20 @@ def generate_task_toml(manifest: HarborTaskManifest) -> str:
 
     # Quote strings safely
     desc_escaped = manifest.task.description.replace('"', '\\"').replace("\n", " ")
+    diff_expl_escaped = manifest.metadata.difficulty_explanation.replace('"', '\\"').replace("\n", " ")
 
     return f"""\
 schema_version = "1.4"
 
 [task]
 name = "{manifest.task.name}"
+version = "{manifest.task.version}"
 description = "{desc_escaped}"
 
 [metadata]
-difficulty = "{manifest.metadata.difficulty}"
+author_name = "{manifest.metadata.author_name}"
+author_email = "{manifest.metadata.author_email}"
+difficulty_explanation = "{diff_expl_escaped}"
 category = "{manifest.metadata.category}"
 tags = {tags_formatted}
 starting_commit_sha = "{commit_sha_str}"
@@ -253,19 +257,20 @@ def generate_verifier_test_sh(test_suite: TestSuiteResponse) -> str:
 
     Executes feature and regression tests and writes the official Harbor
     reward score to /logs/verifier/reward.txt on every execution path.
+    Uses verified container mount paths (/tests/feature and /tests/regression).
     """
     framework = (test_suite.repository.test_framework or "pytest").lower()
 
     if framework == "pytest":
-        run_cmd = "pytest tests/feature tests/regression -v"
+        run_cmd = "pytest /tests/feature /tests/regression -v"
     elif framework == "unittest":
-        run_cmd = "python -m unittest discover -s tests -v"
+        run_cmd = "python -m unittest discover -s /tests -v"
     elif framework in ("jest", "vitest", "mocha"):
-        run_cmd = "npm test"
+        run_cmd = "npm test --prefix /tests"
     elif framework == "go test":
-        run_cmd = "go test ./tests/..."
+        run_cmd = "go test /tests/..."
     else:
-        run_cmd = "pytest tests/ -v"
+        run_cmd = "pytest /tests/feature /tests/regression -v"
 
     return f"""\
 #!/usr/bin/env bash
@@ -358,28 +363,40 @@ def export_harbor_task_package(
     starting_commit_sha = request.resolve_starting_commit_sha()
     val_status: ValidationStatusLiteral = request.resolve_validation_status()
 
+    # Resolve author metadata
+    author_name = request.author_name or "Coding Task Factory"
+    author_email = request.author_email or "benchmark@codingtaskfactory.local"
+    diff_expl = f"Task difficulty rated as {task.difficulty}."
+
+    # Resolve environment configuration (defaulting to conservative 1024 MB RAM)
+    env_config = request.environment or HarborEnvironmentConfig(
+        cpus=2.0,
+        memory_mb=1024,
+        storage_mb=10240,
+        allow_internet=False,
+        build_timeout_sec=600,
+    )
+
     # Build manifest
     manifest = HarborTaskManifest(
         schema_version="1.4",
         task=HarborTaskInfo(
             name=harbor_task_name,
+            version="1.0.0",
             description=task.description[:200],
         ),
         metadata=HarborMetadataConfig(
+            author_name=author_name,
+            author_email=author_email,
             difficulty=task.difficulty,
+            difficulty_explanation=diff_expl,
             category=task.category,
             tags=[task.language, task.category, task.difficulty],
             starting_commit_sha=starting_commit_sha,
             project_name=task.project_name or "standalone_project",
             validation_status=val_status,
         ),
-        environment=HarborEnvironmentConfig(
-            cpus=2.0,
-            memory_mb=4096,
-            storage_mb=10240,
-            allow_internet=False,
-            build_timeout_sec=600,
-        ),
+        environment=env_config,
         agent=HarborAgentConfig(timeout_sec=600),
         verifier=HarborVerifierConfig(timeout_sec=180),
     )

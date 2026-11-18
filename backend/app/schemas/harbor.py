@@ -26,6 +26,10 @@ class HarborTaskInfo(BaseModel):
         description="Unique task name conforming to Harbor conventions (e.g. 'ctf/task-1234')",
         examples=["ctf/task-1234"],
     )
+    version: str = Field(
+        default="1.0.0",
+        description="Task release version conforming to semantic versioning (e.g. '1.0.0')",
+    )
     description: str = Field(
         ...,
         description="High-level task summary or prompt overview",
@@ -34,9 +38,21 @@ class HarborTaskInfo(BaseModel):
 
 class HarborMetadataConfig(BaseModel):
     """Corresponds to [metadata] section in task.toml."""
+    author_name: str = Field(
+        default="Coding Task Factory",
+        description="Author or organization name (defaults to project name, non-personal)",
+    )
+    author_email: str = Field(
+        default="benchmark@codingtaskfactory.local",
+        description="Configurable contact email for the task package (non-personal default)",
+    )
     difficulty: str = Field(
         default="medium",
         description="Task difficulty level (easy, medium, hard)",
+    )
+    difficulty_explanation: str = Field(
+        default="",
+        description="Explanation of task complexity and difficulty required by official Harbor schema",
     )
     category: str = Field(
         default="backend",
@@ -60,22 +76,31 @@ class HarborMetadataConfig(BaseModel):
         description="Empirical validation status: VALIDATED, NOT_VALIDATED, or REJECTED",
     )
 
+    @model_validator(mode="after")
+    def populate_difficulty_explanation(self) -> "HarborMetadataConfig":
+        if not self.difficulty_explanation:
+            self.difficulty_explanation = f"Task difficulty rated as {self.difficulty}."
+        return self
+
 
 class HarborEnvironmentConfig(BaseModel):
     """Corresponds to [environment] section in task.toml."""
     cpus: float = Field(
         default=2.0,
         gt=0,
+        le=32.0,
         description="CPU core allocation for the container sandbox",
     )
     memory_mb: int = Field(
-        default=4096,
+        default=1024,
         gt=0,
-        description="RAM allocation in megabytes (MB), e.g. 4096 for 4GB",
+        le=65536,
+        description="RAM allocation in megabytes (MB). Defaults to conservative 1024 MB for lightweight tasks.",
     )
     storage_mb: int = Field(
         default=10240,
         gt=0,
+        le=1048576,
         description="Disk storage allocation in megabytes (MB), e.g. 10240 for 10GB",
     )
     allow_internet: bool = Field(
@@ -147,6 +172,18 @@ class HarborExportRequest(BaseModel):
     task_prefix: str = Field(
         default="ctf",
         description="Namespace prefix for Harbor task naming (e.g. 'ctf')",
+    )
+    environment: HarborEnvironmentConfig | None = Field(
+        default=None,
+        description="Optional custom container environment resource configuration. Defaults to conservative 1024 MB RAM.",
+    )
+    author_name: str | None = Field(
+        default=None,
+        description="Optional author or organization name to record in task metadata",
+    )
+    author_email: str | None = Field(
+        default=None,
+        description="Optional author contact email to record in task metadata (defaults to non-personal address)",
     )
 
     @model_validator(mode="after")

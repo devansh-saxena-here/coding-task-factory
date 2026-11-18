@@ -145,7 +145,11 @@ class TestHarborSchemas(unittest.TestCase):
 
         self.assertEqual(manifest.schema_version, "1.4")
         self.assertEqual(manifest.task.name, "ctf/task-1234")
+        self.assertEqual(manifest.task.version, "1.0.0")
         self.assertEqual(manifest.metadata.validation_status, "NOT_VALIDATED")
+        self.assertEqual(manifest.metadata.author_name, "Coding Task Factory")
+        self.assertEqual(manifest.metadata.author_email, "benchmark@codingtaskfactory.local")
+        self.assertEqual(manifest.metadata.difficulty_explanation, "Task difficulty rated as medium.")
         self.assertEqual(manifest.environment.memory_mb, 4096)
         self.assertFalse(manifest.environment.allow_internet)
         self.assertEqual(manifest.agent.timeout_sec, 600)
@@ -160,6 +164,14 @@ class TestHarborSchemas(unittest.TestCase):
         # negative memory_mb
         with self.assertRaises(ValidationError):
             HarborEnvironmentConfig(memory_mb=-512)
+
+        # zero memory_mb
+        with self.assertRaises(ValidationError):
+            HarborEnvironmentConfig(memory_mb=0)
+
+        # excessive memory_mb > 65536
+        with self.assertRaises(ValidationError):
+            HarborEnvironmentConfig(memory_mb=70000)
 
         # negative storage_mb
         with self.assertRaises(ValidationError):
@@ -176,11 +188,21 @@ class TestHarborSchemas(unittest.TestCase):
     def test_metadata_structure_and_defaults(self):
         """HarborMetadataConfig provides sensible defaults and validates fields."""
         meta = HarborMetadataConfig()
+        self.assertEqual(meta.author_name, "Coding Task Factory")
+        self.assertEqual(meta.author_email, "benchmark@codingtaskfactory.local")
         self.assertEqual(meta.difficulty, "medium")
+        self.assertEqual(meta.difficulty_explanation, "Task difficulty rated as medium.")
         self.assertEqual(meta.category, "backend")
         self.assertEqual(meta.tags, [])
         self.assertIsNone(meta.starting_commit_sha)
         self.assertEqual(meta.validation_status, "NOT_VALIDATED")
+
+    def test_environment_default_memory_is_conservative(self):
+        """HarborEnvironmentConfig defaults to conservative 1024 MB RAM."""
+        env = HarborEnvironmentConfig()
+        self.assertEqual(env.memory_mb, 1024)
+        self.assertEqual(env.cpus, 2.0)
+        self.assertEqual(env.storage_mb, 10240)
 
     def test_validation_status_literal_restriction(self):
         """validation_status must strictly be VALIDATED, NOT_VALIDATED, or REJECTED."""

@@ -9,10 +9,17 @@ Zero untrusted code is executed.
 
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 import zipfile
 
-from app.schemas.harbor import HarborExportRequest, HarborMetadataConfig, HarborTaskInfo, HarborTaskManifest
+from app.schemas.harbor import (
+    HarborEnvironmentConfig,
+    HarborExportRequest,
+    HarborMetadataConfig,
+    HarborTaskInfo,
+    HarborTaskManifest,
+)
 from app.schemas.solution import SolutionFile, SolutionResponse
 from app.schemas.task import TaskResponse
 from app.schemas.test_suite import RepositoryMetadata, TestCase, TestFile, TestSuiteResponse
@@ -209,34 +216,40 @@ class TestHarborService(unittest.TestCase):
         self.assertNotIn("assert True", content)
 
     def test_generate_task_toml_format(self):
-        """task.toml serializes strictly according to Harbor schema 1.4."""
+        """task.toml serializes strictly according to Harbor schema 1.4 and parses as valid TOML."""
         manifest = HarborTaskManifest(
             schema_version="1.4",
-            task=HarborTaskInfo(name="ctf/task-1234", description="Add caching"),
+            task=HarborTaskInfo(name="ctf/task-1234", version="1.0.0", description="Add caching"),
             metadata=HarborMetadataConfig(
+                author_name="Coding Task Factory",
+                author_email="benchmark@codingtaskfactory.local",
                 difficulty="hard",
+                difficulty_explanation="Task difficulty rated as hard.",
                 category="backend",
                 tags=["python", "fastapi"],
                 starting_commit_sha="fedcba9876543210",
                 project_name="store_api",
                 validation_status="NOT_VALIDATED",
             ),
+            environment=HarborEnvironmentConfig(memory_mb=1024),
         )
         toml_text = generate_task_toml(manifest)
 
-        self.assertIn('schema_version = "1.4"', toml_text)
-        self.assertIn('[task]', toml_text)
-        self.assertIn('name = "ctf/task-1234"', toml_text)
-        self.assertIn('[metadata]', toml_text)
-        self.assertIn('starting_commit_sha = "fedcba9876543210"', toml_text)
-        self.assertIn('validation_status = "NOT_VALIDATED"', toml_text)
-        self.assertIn('[environment]', toml_text)
-        self.assertIn('memory_mb = 4096', toml_text)
-        self.assertIn('allow_internet = false', toml_text)
-        self.assertIn('[agent]', toml_text)
-        self.assertIn('timeout_sec = 600', toml_text)
-        self.assertIn('[verifier]', toml_text)
-        self.assertIn('timeout_sec = 180', toml_text)
+        # Parse with standard library tomllib to guarantee 100% valid TOML syntax
+        parsed = tomllib.loads(toml_text)
+        self.assertEqual(parsed["schema_version"], "1.4")
+        self.assertEqual(parsed["task"]["name"], "ctf/task-1234")
+        self.assertEqual(parsed["task"]["version"], "1.0.0")
+        self.assertEqual(parsed["metadata"]["author_name"], "Coding Task Factory")
+        self.assertEqual(parsed["metadata"]["author_email"], "benchmark@codingtaskfactory.local")
+        self.assertEqual(parsed["metadata"]["difficulty_explanation"], "Task difficulty rated as hard.")
+        self.assertNotIn("difficulty", parsed["metadata"])  # Bare unsupported 'difficulty' field not emitted
+        self.assertEqual(parsed["metadata"]["starting_commit_sha"], "fedcba9876543210")
+        self.assertEqual(parsed["metadata"]["validation_status"], "NOT_VALIDATED")
+        self.assertEqual(parsed["environment"]["memory_mb"], 1024)
+        self.assertFalse(parsed["environment"]["allow_internet"])
+        self.assertEqual(parsed["agent"]["timeout_sec"], 600)
+        self.assertEqual(parsed["verifier"]["timeout_sec"], 180)
 
     def test_generate_environment_dockerfile_pins_sha(self):
         """environment/Dockerfile contains starting commit SHA and runtime setup."""
@@ -250,16 +263,17 @@ class TestHarborService(unittest.TestCase):
         self.assertIn("pip install", dockerfile)
 
     def test_generate_verifier_test_sh_reward_writing(self):
-        """tests/test.sh writes 1.0 on pass and 0.0 on fail to /logs/verifier/reward.txt."""
+        """tests/test.sh writes 1.0 on pass and 0.0 on fail to /logs/verifier/reward.txt with mount paths."""
         test_suite = _make_dummy_test_suite()
         script = generate_verifier_test_sh(test_suite)
 
         self.assertIn("#!/usr/bin/env bash", script)
+        self.assertIn("set -o pipefail", script)
         self.assertIn("mkdir -p /logs/verifier", script)
         self.assertIn('REWARD_FILE="/logs/verifier/reward.txt"', script)
-        self.assertIn('echo "1.0" > "$REWARD_FILE"', script)
         self.assertIn('echo "0.0" > "$REWARD_FILE"', script)
-        self.assertIn("pytest tests/feature tests/regression -v", script)
+        self.assertIn("pytest /tests/feature /tests/regression -v", script)
+        self.assertIn('echo "1.0" > "$REWARD_FILE"', script)
 
     def test_generate_oracle_solve_sh(self):
         """solution/solve.sh copies solution files to /workspace."""
@@ -382,6 +396,75 @@ class TestHarborService(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 export_harbor_task_package(req, output_dir=tmp_dir)
             self.assertIn("Duplicate solution file path", str(ctx.exception))
+
+    def test_export_default_memory_is_conservative_1024mb(self):
+        """Export defaults container memory to conservative 1024 MB."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _make_dummy_task("task-mem-def")
+            solution = _make_dummy_solution("task-mem-def")
+            test_suite = _make_dummy_test_suite("task-mem-def")
+
+            req = HarborExportRequest(
+                task=task,
+                solution=solution,
+                test_suite=test_suite,
+            )
+
+            zip_path, _ = export_harbor_task_package(req, output_dir=tmp_dir)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                toml_text = zf.read("ctf-task-mem-def/task.toml").decode("utf-8")
+                parsed = tomllib.loads(toml_text)
+                self.assertEqual(parsed["environment"]["memory_mb"], 1024)
+                self.assertEqual(parsed["task"]["version"], "1.0.0")
+                self.assertEqual(parsed["metadata"]["author_name"], "Coding Task Factory")
+                self.assertEqual(parsed["metadata"]["author_email"], "benchmark@codingtaskfactory.local")
+
+    def test_export_custom_memory_and_author_metadata(self):
+        """Export accepts custom memory and author metadata configuration."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task = _make_dummy_task("task-custom")
+            solution = _make_dummy_solution("task-custom")
+            test_suite = _make_dummy_test_suite("task-custom")
+
+            req = HarborExportRequest(
+                task=task,
+                solution=solution,
+                test_suite=test_suite,
+                environment=HarborEnvironmentConfig(memory_mb=2048, cpus=4.0),
+                author_name="Evaluation Research Lab",
+                author_email="eval@researchlab.org",
+            )
+
+            zip_path, _ = export_harbor_task_package(req, output_dir=tmp_dir)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                toml_text = zf.read("ctf-task-custom/task.toml").decode("utf-8")
+                parsed = tomllib.loads(toml_text)
+                self.assertEqual(parsed["environment"]["memory_mb"], 2048)
+                self.assertEqual(parsed["environment"]["cpus"], 4.0)
+                self.assertEqual(parsed["metadata"]["author_name"], "Evaluation Research Lab")
+                self.assertEqual(parsed["metadata"]["author_email"], "eval@researchlab.org")
+                self.assertNotIn("password", toml_text)
+                self.assertNotIn("api_key", toml_text)
+
+    def test_verifier_test_sh_different_frameworks(self):
+        """tests/test.sh generates proper mount paths for unittest, npm, and go test."""
+        # Unittest
+        suite_unittest = _make_dummy_test_suite()
+        suite_unittest.repository.test_framework = "unittest"
+        sh_unittest = generate_verifier_test_sh(suite_unittest)
+        self.assertIn("python -m unittest discover -s /tests -v", sh_unittest)
+
+        # NPM
+        suite_npm = _make_dummy_test_suite()
+        suite_npm.repository.test_framework = "jest"
+        sh_npm = generate_verifier_test_sh(suite_npm)
+        self.assertIn("npm test --prefix /tests", sh_npm)
+
+        # Go test
+        suite_go = _make_dummy_test_suite()
+        suite_go.repository.test_framework = "go test"
+        sh_go = generate_verifier_test_sh(suite_go)
+        self.assertIn("go test /tests/...", sh_go)
 
 
 if __name__ == "__main__":
