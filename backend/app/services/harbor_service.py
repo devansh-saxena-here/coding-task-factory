@@ -166,6 +166,7 @@ def generate_task_toml(manifest: HarborTaskManifest) -> str:
     Serializes a HarborTaskManifest strictly according to Harbor schema 1.4.
     """
     tags_formatted = json.dumps(manifest.metadata.tags)
+    artifacts_formatted = json.dumps(manifest.artifacts)
     commit_sha_str = manifest.metadata.starting_commit_sha or ""
 
     # Quote strings safely
@@ -174,6 +175,7 @@ def generate_task_toml(manifest: HarborTaskManifest) -> str:
 
     return f"""\
 schema_version = "1.4"
+artifacts = {artifacts_formatted}
 
 [task]
 name = "{manifest.task.name}"
@@ -202,6 +204,7 @@ timeout_sec = {manifest.agent.timeout_sec}
 
 [verifier]
 timeout_sec = {manifest.verifier.timeout_sec}
+environment_mode = "{manifest.verifier.environment_mode}"
 """
 
 
@@ -209,14 +212,17 @@ def generate_environment_dockerfile(task: TaskResponse, repo_meta: RepositoryMet
     """
     Generates environment/Dockerfile for sandboxed agent evaluation.
 
-    Pins starting commit SHA and runtime dependencies.
+    Pins starting commit SHA and runtime dependencies with exact version pins.
     """
     lang = (task.language or "python").lower()
     commit_sha = (repo_meta.starting_commit_sha if repo_meta else None) or task.starting_commit_sha or "HEAD"
 
     if "python" in lang:
         base_image = "python:3.11-slim"
-        dep_install = "RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi && pip install --no-cache-dir pytest"
+        dep_install = (
+            "RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi \\\n"
+            "    && pip install --no-cache-dir pytest==8.3.4"
+        )
     elif any(js in lang for js in ("javascript", "typescript", "node")):
         base_image = "node:20-slim"
         dep_install = "RUN if [ -f package.json ]; then npm install; fi"
@@ -225,7 +231,7 @@ def generate_environment_dockerfile(task: TaskResponse, repo_meta: RepositoryMet
         dep_install = "RUN if [ -f go.mod ]; then go mod download; fi"
     else:
         base_image = "python:3.11-slim"
-        dep_install = "RUN pip install --no-cache-dir pytest"
+        dep_install = "RUN pip install --no-cache-dir pytest==8.3.4"
 
     return f"""\
 FROM {base_image}
@@ -247,6 +253,56 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 {dep_install}
 
 # Default working environment
+CMD ["/bin/bash"]
+"""
+
+
+def generate_verifier_dockerfile(test_suite: TestSuiteResponse) -> str:
+    """
+    Generates tests/Dockerfile for the dedicated, isolated verifier container.
+
+    Build context is the tests/ directory.
+    Installs pinned verification dependencies and copies tests into /tests/.
+    Prepares artifact mount point /workspace and verifier logs directory.
+    """
+    lang = (test_suite.repository.detected_language or "python").lower()
+
+    if "python" in lang:
+        base_image = "python:3.11-slim"
+        dep_install = "RUN pip install --no-cache-dir pytest==8.3.4"
+    elif any(js in lang for js in ("javascript", "typescript", "node")):
+        base_image = "node:20-slim"
+        dep_install = "RUN if [ -f package.json ]; then npm install; fi"
+    elif "go" in lang:
+        base_image = "golang:1.22-bookworm"
+        dep_install = "RUN if [ -f go.mod ]; then go mod download; fi"
+    else:
+        base_image = "python:3.11-slim"
+        dep_install = "RUN pip install --no-cache-dir pytest==8.3.4"
+
+    return f"""\
+FROM {base_image}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install common system utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    git \\
+    curl \\
+    ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pinned test runner dependencies
+{dep_install}
+
+# Create required artifact handoff and verifier log directories
+RUN mkdir -p /workspace /logs/verifier
+
+# Copy verifier test suite and scripts into the container
+COPY . /tests/
+RUN chmod +x /tests/test.sh
+
+WORKDIR /workspace
 CMD ["/bin/bash"]
 """
 
@@ -378,8 +434,11 @@ def export_harbor_task_package(
     )
 
     # Build manifest
+    artifacts_list = request.artifacts or ["/workspace"]
+
     manifest = HarborTaskManifest(
         schema_version="1.4",
+        artifacts=artifacts_list,
         task=HarborTaskInfo(
             name=harbor_task_name,
             version="1.0.0",
@@ -398,7 +457,7 @@ def export_harbor_task_package(
         ),
         environment=env_config,
         agent=HarborAgentConfig(timeout_sec=600),
-        verifier=HarborVerifierConfig(timeout_sec=180),
+        verifier=HarborVerifierConfig(timeout_sec=180, environment_mode="separate"),
     )
 
     # Determine destination root
@@ -442,12 +501,17 @@ def export_harbor_task_package(
         tests_dir = staged_task_dir / "tests"
         tests_dir.mkdir(parents=True)
 
-        # 4a. tests/test.sh verifier
+        # 4a. tests/Dockerfile for isolated verifier sandbox
+        verifier_dockerfile_path = tests_dir / "Dockerfile"
+        verifier_dockerfile_path.write_text(generate_verifier_dockerfile(test_suite), encoding="utf-8")
+        exported_relative_files.append("tests/Dockerfile")
+
+        # 4b. tests/test.sh verifier entrypoint
         test_sh_path = tests_dir / "test.sh"
         test_sh_path.write_text(generate_verifier_test_sh(test_suite), encoding="utf-8")
         exported_relative_files.append("tests/test.sh")
 
-        # 4b. tests/feature/ test files
+        # 4c. tests/feature/ test files
         feat_dir = tests_dir / "feature"
         feat_dir.mkdir(parents=True)
         seen_test_paths: set[str] = set()
@@ -464,7 +528,7 @@ def export_harbor_task_package(
             seen_test_paths.add(clean_name)
             exported_relative_files.append(f"tests/feature/{clean_name}")
 
-        # 4c. tests/regression/ test files
+        # 4d. tests/regression/ test files
         reg_dir = tests_dir / "regression"
         reg_dir.mkdir(parents=True)
 

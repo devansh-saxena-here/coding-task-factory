@@ -31,6 +31,7 @@ from app.services.harbor_service import (
     generate_instruction_markdown,
     generate_oracle_solve_sh,
     generate_task_toml,
+    generate_verifier_dockerfile,
     generate_verifier_test_sh,
     validate_export_file_path,
 )
@@ -238,6 +239,7 @@ class TestHarborService(unittest.TestCase):
         # Parse with standard library tomllib to guarantee 100% valid TOML syntax
         parsed = tomllib.loads(toml_text)
         self.assertEqual(parsed["schema_version"], "1.4")
+        self.assertEqual(parsed["artifacts"], ["/workspace"])
         self.assertEqual(parsed["task"]["name"], "ctf/task-1234")
         self.assertEqual(parsed["task"]["version"], "1.0.0")
         self.assertEqual(parsed["metadata"]["author_name"], "Coding Task Factory")
@@ -250,9 +252,10 @@ class TestHarborService(unittest.TestCase):
         self.assertFalse(parsed["environment"]["allow_internet"])
         self.assertEqual(parsed["agent"]["timeout_sec"], 600)
         self.assertEqual(parsed["verifier"]["timeout_sec"], 180)
+        self.assertEqual(parsed["verifier"]["environment_mode"], "separate")
 
-    def test_generate_environment_dockerfile_pins_sha(self):
-        """environment/Dockerfile contains starting commit SHA and runtime setup."""
+    def test_generate_environment_dockerfile_pins_sha_and_dependencies(self):
+        """environment/Dockerfile contains starting commit SHA and exact pinned dependencies."""
         task = _make_dummy_task()
         repo_meta = RepositoryMetadata(project_name="store", starting_commit_sha="a1b2c3d4e5f67890123456789abcdef012345678")
         dockerfile = generate_environment_dockerfile(task, repo_meta)
@@ -260,7 +263,21 @@ class TestHarborService(unittest.TestCase):
         self.assertIn("FROM python:3.11-slim", dockerfile)
         self.assertIn('STARTING_COMMIT_SHA="a1b2c3d4e5f67890123456789abcdef012345678"', dockerfile)
         self.assertIn("WORKDIR /workspace", dockerfile)
-        self.assertIn("pip install", dockerfile)
+        self.assertIn("pip install --no-cache-dir pytest==8.3.4", dockerfile)
+        # Ensure no unpinned pytest invocation exists
+        self.assertNotIn("pip install --no-cache-dir pytest\n", dockerfile)
+
+    def test_generate_verifier_dockerfile_pins_dependencies_and_artifacts(self):
+        """tests/Dockerfile builds isolated verifier container with pinned pytest and artifact setup."""
+        test_suite = _make_dummy_test_suite()
+        dockerfile = generate_verifier_dockerfile(test_suite)
+
+        self.assertIn("FROM python:3.11-slim", dockerfile)
+        self.assertIn("pip install --no-cache-dir pytest==8.3.4", dockerfile)
+        self.assertIn("mkdir -p /workspace /logs/verifier", dockerfile)
+        self.assertIn("COPY . /tests/", dockerfile)
+        self.assertIn("chmod +x /tests/test.sh", dockerfile)
+        self.assertIn("WORKDIR /workspace", dockerfile)
 
     def test_generate_verifier_test_sh_reward_writing(self):
         """tests/test.sh writes 1.0 on pass and 0.0 on fail to /logs/verifier/reward.txt with mount paths."""
@@ -318,6 +335,7 @@ class TestHarborService(unittest.TestCase):
                 self.assertIn(f"{prefix}task.toml", namelist)
                 self.assertIn(f"{prefix}instruction.md", namelist)
                 self.assertIn(f"{prefix}environment/Dockerfile", namelist)
+                self.assertIn(f"{prefix}tests/Dockerfile", namelist)
                 self.assertIn(f"{prefix}tests/test.sh", namelist)
                 self.assertIn(f"{prefix}tests/feature/test_feature_cache.py", namelist)
                 self.assertIn(f"{prefix}tests/regression/test_regression_checkout.py", namelist)
@@ -415,9 +433,11 @@ class TestHarborService(unittest.TestCase):
                 toml_text = zf.read("ctf-task-mem-def/task.toml").decode("utf-8")
                 parsed = tomllib.loads(toml_text)
                 self.assertEqual(parsed["environment"]["memory_mb"], 1024)
+                self.assertEqual(parsed["artifacts"], ["/workspace"])
                 self.assertEqual(parsed["task"]["version"], "1.0.0")
                 self.assertEqual(parsed["metadata"]["author_name"], "Coding Task Factory")
                 self.assertEqual(parsed["metadata"]["author_email"], "benchmark@codingtaskfactory.local")
+                self.assertEqual(parsed["verifier"]["environment_mode"], "separate")
 
     def test_export_custom_memory_and_author_metadata(self):
         """Export accepts custom memory and author metadata configuration."""

@@ -70,18 +70,21 @@ jobs:
           echo "=== Verifying Required Harbor Package Assets ==="
           test -f "${TASK_DIR}/task.toml" || (echo "Missing task.toml" && exit 1)
           test -f "${TASK_DIR}/instruction.md" || (echo "Missing instruction.md" && exit 1)
-          test -f "${TASK_DIR}/environment/Dockerfile" || (echo "Missing Dockerfile" && exit 1)
+          test -f "${TASK_DIR}/environment/Dockerfile" || (echo "Missing environment/Dockerfile" && exit 1)
+          test -f "${TASK_DIR}/tests/Dockerfile" || (echo "Missing tests/Dockerfile" && exit 1)
           test -f "${TASK_DIR}/solution/solve.sh" || (echo "Missing solve.sh" && exit 1)
-          test -f "${TASK_DIR}/tests/test.sh" || (echo "Missing test.sh" && exit 1)
+          test -f "${TASK_DIR}/tests/test.sh" || (echo "Missing tests/test.sh" && exit 1)
           echo "All essential task package files verified on disk."
 
       - name: Run Harbor Lint
+        id: run-lint
         run: |
           TASK_DIR="staged_harbor_task/ctf-sample-math-task"
           echo "=== Running Harbor Static Linter against Generated Task ==="
           harbor lint "${TASK_DIR}"
 
       - name: Execute Harbor Oracle Evaluation
+        id: run-oracle
         run: |
           TASK_DIR="staged_harbor_task/ctf-sample-math-task"
           mkdir -p harbor_jobs
@@ -94,11 +97,18 @@ jobs:
           echo "=== Inspecting Harbor Evaluation Results & Reward Score ==="
           python - << 'EOF'
           import json
+          import os
           import sys
           from pathlib import Path
 
           jobs_dir = Path("harbor_jobs")
           result_files = list(jobs_dir.glob("**/result.json"))
+
+          def record_output(score):
+              gh_out = os.environ.get("GITHUB_OUTPUT")
+              if gh_out and os.path.exists(gh_out):
+                  with open(gh_out, "a", encoding="utf-8") as out:
+                      out.write(f"reward_score={score}\n")
 
           if not result_files:
               print(f"ERROR: No result.json found under {jobs_dir.resolve()}", file=sys.stderr)
@@ -109,6 +119,7 @@ jobs:
                   val = reward_files[0].read_text().strip()
                   print(f"Reward value: {val}")
                   if float(val) == 1.0:
+                      record_output("1.0")
                       print("REWARD_VERIFIED=1.0")
                       sys.exit(0)
               sys.exit(1)
@@ -137,6 +148,8 @@ jobs:
               print("ERROR: Reward score could not be determined from result.json", file=sys.stderr)
               sys.exit(1)
 
+          record_output(str(reward))
+
           if float(reward) != 1.0:
               print(f"ERROR: Oracle verification failed. Expected reward 1.0, got {reward}", file=sys.stderr)
               sys.exit(1)
@@ -147,18 +160,52 @@ jobs:
       - name: Generate Job Execution Summary
         if: always()
         run: |
-          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          LINT_OUTCOME="${{ steps.run-lint.outcome }}"
+          ORACLE_OUTCOME="${{ steps.run-oracle.outcome }}"
+          REWARD_OUTCOME="${{ steps.verify-reward.outcome }}"
+          REWARD_SCORE="${{ steps.verify-reward.outputs.reward_score }}"
+
+          format_status() {
+            case "$1" in
+              success) echo "PASSED" ;;
+              failure) echo "FAILED" ;;
+              skipped) echo "SKIPPED" ;;
+              cancelled) echo "CANCELLED" ;;
+              *) echo "NOT_RUN (${1:-unknown})" ;;
+            esac
+          }
+
+          LINT_STATUS=$(format_status "$LINT_OUTCOME")
+          ORACLE_STATUS=$(format_status "$ORACLE_OUTCOME")
+          REWARD_STATUS=$(format_status "$REWARD_OUTCOME")
+
+          if [ "$LINT_OUTCOME" = "success" ] && [ "$ORACLE_OUTCOME" = "success" ] && [ "$REWARD_OUTCOME" = "success" ]; then
+            OVERALL_VERDICT="SUCCESS"
+            NOTE_BLOCK="> [!NOTE]\n> The Oracle evaluation validates the reference solution (\`solution/solve.sh\`) and verifier (\`tests/test.sh\`) inside an isolated container sandbox. Real AI coding agent benchmarking was **NOT** performed during this test."
+          else
+            OVERALL_VERDICT="FAILURE"
+            NOTE_BLOCK="> [!CAUTION]\n> Harbor task package verification did not pass. Inspect step logs and uploaded artifacts for failure diagnostics."
+          fi
+
+          if [ -z "$REWARD_SCORE" ]; then
+            REWARD_DISPLAY="N/A"
+          else
+            REWARD_DISPLAY="$REWARD_SCORE"
+          fi
+
+          cat << EOF >> $GITHUB_STEP_SUMMARY
           ## Harbor Task Package Verification Summary
 
-          - **Task Name**: `ctf/sample-math-task`
-          - **Harbor Specification Version**: `1.4`
-          - **Harbor CLI Version**: `0.25.0`
-          - **Task Linter (`harbor lint`)**: `PASSED`
-          - **Oracle Evaluation (`harbor run -a oracle`)**: `PASSED`
-          - **Reward Verified**: `1.0` (Complete verification test success)
+          **Overall Verdict: ${OVERALL_VERDICT}**
 
-          > [!NOTE]
-          > The Oracle evaluation validates the reference solution (`solution/solve.sh`) and verifier (`tests/test.sh`) inside an isolated container sandbox. Real AI coding agent benchmarking was **NOT** performed during this test.
+          - **Task Name**: \`ctf/sample-math-task\`
+          - **Harbor Specification Version**: \`1.4\`
+          - **Harbor CLI Version**: \`${{ github.event.inputs.harbor_version || '0.25.0' }}\`
+          - **Task Linter (\`harbor lint\`)**: **${LINT_STATUS}**
+          - **Oracle Evaluation (\`harbor run -a oracle\`)**: **${ORACLE_STATUS}**
+          - **Reward Verification**: **${REWARD_STATUS}** (Score: \`${REWARD_DISPLAY}\`)
+
+          $(echo -e "${NOTE_BLOCK}")
           EOF
 
       - name: Upload Diagnostic Artifacts

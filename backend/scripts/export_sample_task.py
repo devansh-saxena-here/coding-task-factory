@@ -223,11 +223,12 @@ def export_sample_task(target_dir: Path) -> Path:
     if not task_folder.exists():
         raise FileNotFoundError(f"Expected extracted directory not found: {task_folder}")
 
-    # Verify all 5 essential Harbor assets are present
+    # Verify all 6 essential Harbor assets are present
     required_assets = [
         task_folder / "task.toml",
         task_folder / "instruction.md",
         task_folder / "environment" / "Dockerfile",
+        task_folder / "tests" / "Dockerfile",
         task_folder / "solution" / "solve.sh",
         task_folder / "tests" / "test.sh",
     ]

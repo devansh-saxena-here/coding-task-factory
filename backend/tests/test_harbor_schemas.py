@@ -144,6 +144,7 @@ class TestHarborSchemas(unittest.TestCase):
         )
 
         self.assertEqual(manifest.schema_version, "1.4")
+        self.assertEqual(manifest.artifacts, ["/workspace"])
         self.assertEqual(manifest.task.name, "ctf/task-1234")
         self.assertEqual(manifest.task.version, "1.0.0")
         self.assertEqual(manifest.metadata.validation_status, "NOT_VALIDATED")
@@ -154,6 +155,18 @@ class TestHarborSchemas(unittest.TestCase):
         self.assertFalse(manifest.environment.allow_internet)
         self.assertEqual(manifest.agent.timeout_sec, 600)
         self.assertEqual(manifest.verifier.timeout_sec, 180)
+        self.assertEqual(manifest.verifier.environment_mode, "separate")
+
+    def test_verifier_environment_mode_validation(self):
+        """verifier environment_mode defaults to separate and restricts to literal choices."""
+        v_default = HarborVerifierConfig()
+        self.assertEqual(v_default.environment_mode, "separate")
+
+        v_shared = HarborVerifierConfig(environment_mode="shared")
+        self.assertEqual(v_shared.environment_mode, "shared")
+
+        with self.assertRaises(ValidationError):
+            HarborVerifierConfig(environment_mode="invalid_mode")
 
     def test_invalid_resource_limits_raise_validation_error(self):
         """Invalid or non-positive resource limits raise ValidationError."""

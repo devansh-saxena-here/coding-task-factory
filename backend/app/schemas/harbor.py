@@ -130,6 +130,10 @@ class HarborVerifierConfig(BaseModel):
         gt=0,
         description="Maximum verifier execution timeout in seconds",
     )
+    environment_mode: Literal["separate", "shared"] = Field(
+        default="separate",
+        description="Verifier environment isolation mode: 'separate' (isolated sandbox) or 'shared'",
+    )
 
 
 class HarborTaskManifest(BaseModel):
@@ -139,6 +143,10 @@ class HarborTaskManifest(BaseModel):
     schema_version: str = Field(
         default="1.4",
         description="Official Harbor schema version",
+    )
+    artifacts: list[str] = Field(
+        default_factory=lambda: ["/workspace"],
+        description="Declared artifacts transferred from agent sandbox to separate verifier sandbox",
     )
     task: HarborTaskInfo
     metadata: HarborMetadataConfig
@@ -184,6 +192,10 @@ class HarborExportRequest(BaseModel):
     author_email: str | None = Field(
         default=None,
         description="Optional author contact email to record in task metadata (defaults to non-personal address)",
+    )
+    artifacts: list[str] | None = Field(
+        default=None,
+        description="Optional list of artifact paths to transfer to verifier container. Defaults to ['/workspace'].",
     )
 
     @model_validator(mode="after")
