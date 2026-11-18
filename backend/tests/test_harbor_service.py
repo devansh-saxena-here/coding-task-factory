@@ -7,6 +7,7 @@ path traversal security, forbidden file rejections, and cleanup guarantees.
 Zero untrusted code is executed.
 """
 
+import json
 from pathlib import Path
 import tempfile
 import tomllib
@@ -27,12 +28,15 @@ from app.schemas.validation import ValidationReport
 from app.services import harbor_service
 from app.services.harbor_service import (
     export_harbor_task_package,
+    extract_harbor_reward,
+    find_and_extract_harbor_reward,
     generate_environment_dockerfile,
     generate_instruction_markdown,
     generate_oracle_solve_sh,
     generate_task_toml,
     generate_verifier_dockerfile,
     generate_verifier_test_sh,
+    parse_finite_numeric_reward,
     validate_export_file_path,
 )
 
@@ -485,6 +489,212 @@ class TestHarborService(unittest.TestCase):
         suite_go.repository.test_framework = "go test"
         sh_go = generate_verifier_test_sh(suite_go)
         self.assertIn("go test /tests/...", sh_go)
+
+
+class TestHarborRewardExtraction(unittest.TestCase):
+    """Unit tests for Harbor evaluation result parsing and reward verification protocol."""
+
+    def test_parse_finite_numeric_reward_valid(self):
+        """Valid finite numeric values (int, float, numeric strings) are accepted, including 0.0."""
+        self.assertEqual(parse_finite_numeric_reward(1.0), 1.0)
+        self.assertEqual(parse_finite_numeric_reward(0.0), 0.0)
+        self.assertEqual(parse_finite_numeric_reward(0), 0.0)
+        self.assertEqual(parse_finite_numeric_reward(1), 1.0)
+        self.assertEqual(parse_finite_numeric_reward("1.0"), 1.0)
+        self.assertEqual(parse_finite_numeric_reward(" 0.0 "), 0.0)
+        self.assertEqual(parse_finite_numeric_reward("0.85"), 0.85)
+
+    def test_parse_finite_numeric_reward_invalid_and_rejects_bools(self):
+        """None, booleans, NaN, infinities, and invalid strings are strictly rejected."""
+        self.assertIsNone(parse_finite_numeric_reward(None))
+        self.assertIsNone(parse_finite_numeric_reward(True))
+        self.assertIsNone(parse_finite_numeric_reward(False))
+        self.assertIsNone(parse_finite_numeric_reward(float("nan")))
+        self.assertIsNone(parse_finite_numeric_reward(float("inf")))
+        self.assertIsNone(parse_finite_numeric_reward(float("-inf")))
+        self.assertIsNone(parse_finite_numeric_reward("NaN"))
+        self.assertIsNone(parse_finite_numeric_reward("inf"))
+        self.assertIsNone(parse_finite_numeric_reward("invalid_score"))
+        self.assertIsNone(parse_finite_numeric_reward([]))
+        self.assertIsNone(parse_finite_numeric_reward({}))
+
+    def test_extract_harbor_reward_valid_trial_result(self):
+        """Extracts valid reward 1.0 from TrialResult with verifier_result.rewards.reward."""
+        payload = {
+            "id": "trial-abc-123",
+            "verifier_result": {
+                "rewards": {
+                    "reward": 1.0,
+                },
+            },
+        }
+        score, path = extract_harbor_reward(payload)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(path, "verifier_result.rewards.reward")
+
+    def test_extract_harbor_reward_valid_job_result(self):
+        """Extracts valid reward 1.0 from JobResult with trial_results list."""
+        payload = {
+            "job_id": "job-2026-11-18",
+            "trial_results": [
+                {
+                    "id": "trial-001",
+                    "verifier_result": {
+                        "rewards": {
+                            "reward": 1.0,
+                        },
+                    },
+                }
+            ],
+        }
+        score, path = extract_harbor_reward(payload)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(path, "trial_results[0].verifier_result.rewards.reward")
+
+    def test_extract_harbor_reward_job_result_trials_alias(self):
+        """Extracts valid reward from JobResult using trials alias."""
+        payload = {
+            "trials": [
+                {
+                    "verifier_result": {
+                        "rewards": {
+                            "reward": 1.0,
+                        }
+                    }
+                }
+            ]
+        }
+        score, path = extract_harbor_reward(payload)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(path, "trials[0].verifier_result.rewards.reward")
+
+    def test_extract_harbor_reward_zero_score(self):
+        """Reward score 0.0 is cleanly extracted and not treated as falsy or missing."""
+        payload = {
+            "verifier_result": {
+                "rewards": {
+                    "reward": 0.0,
+                },
+            },
+        }
+        score, path = extract_harbor_reward(payload)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(path, "verifier_result.rewards.reward")
+
+    def test_extract_harbor_reward_single_custom_metric_key(self):
+        """Extracts score from a single labeled custom metric inside rewards."""
+        payload = {
+            "verifier_result": {
+                "rewards": {
+                    "accuracy": 1.0,
+                },
+            },
+        }
+        score, path = extract_harbor_reward(payload)
+        self.assertEqual(score, 1.0)
+        self.assertEqual(path, "verifier_result.rewards.accuracy")
+
+    def test_extract_harbor_reward_scalar_rewards_and_direct_reward(self):
+        """Handles scalar rewards in verifier_result or direct reward property."""
+        payload1 = {"verifier_result": {"rewards": 1.0}}
+        score1, path1 = extract_harbor_reward(payload1)
+        self.assertEqual(score1, 1.0)
+        self.assertEqual(path1, "verifier_result.rewards")
+
+        payload2 = {"verifier_result": {"reward": 1.0}}
+        score2, path2 = extract_harbor_reward(payload2)
+        self.assertEqual(score2, 1.0)
+        self.assertEqual(path2, "verifier_result.reward")
+
+    def test_extract_harbor_reward_missing_verifier_result(self):
+        """Returns None when verifier_result is missing from trial data."""
+        payload = {"id": "trial-failed-before-eval"}
+        score, _ = extract_harbor_reward(payload)
+        self.assertIsNone(score)
+
+    def test_extract_harbor_reward_missing_rewards(self):
+        """Returns None when rewards mapping is missing from verifier_result."""
+        payload = {"verifier_result": {"metrics": {"elapsed": 12.3}}}
+        score, _ = extract_harbor_reward(payload)
+        self.assertIsNone(score)
+
+    def test_extract_harbor_reward_empty_rewards_dict(self):
+        """Returns None when rewards dictionary is empty."""
+        payload = {"verifier_result": {"rewards": {}}}
+        score, _ = extract_harbor_reward(payload)
+        self.assertIsNone(score)
+
+    def test_extract_harbor_reward_null_or_non_numeric(self):
+        """Returns None when reward value is null, boolean, or non-numeric."""
+        self.assertIsNone(extract_harbor_reward({"verifier_result": {"rewards": {"reward": None}}})[0])
+        self.assertIsNone(extract_harbor_reward({"verifier_result": {"rewards": {"reward": "N/A"}}})[0])
+        self.assertIsNone(extract_harbor_reward({"verifier_result": {"rewards": {"reward": True}}})[0])
+        self.assertIsNone(extract_harbor_reward({"verifier_result": {"rewards": {"reward": float("nan")}}})[0])
+        self.assertIsNone(extract_harbor_reward({"verifier_result": {"rewards": {"reward": float("inf")}}})[0])
+
+    def test_find_and_extract_harbor_reward_from_directory(self):
+        """Scans directory and extracts reward from result.json, JobResult, or reward.txt fallback."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            jobs_dir = Path(tmp_str)
+
+            # 1. Non-existent jobs dir
+            score, _, _ = find_and_extract_harbor_reward(jobs_dir / "nonexistent")
+            self.assertIsNone(score)
+
+            # 2. Empty jobs dir
+            score, _, _ = find_and_extract_harbor_reward(jobs_dir)
+            self.assertIsNone(score)
+
+            # 3. JobResult file at job root
+            job_res_file = jobs_dir / "result.json"
+            job_res_file.write_text(
+                json.dumps({
+                    "trial_results": [
+                        {
+                            "verifier_result": {
+                                "rewards": {
+                                    "reward": 1.0,
+                                },
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            score, src, path = find_and_extract_harbor_reward(jobs_dir)
+            self.assertEqual(score, 1.0)
+            self.assertIn("trial_results[0].verifier_result.rewards.reward", path)
+
+            # 4. Deeper TrialResult file takes precedence
+            trial_dir = jobs_dir / "trial_01"
+            trial_dir.mkdir()
+            trial_res_file = trial_dir / "result.json"
+            trial_res_file.write_text(
+                json.dumps({
+                    "verifier_result": {
+                        "rewards": {
+                            "reward": 1.0,
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            score_deep, src_deep, path_deep = find_and_extract_harbor_reward(jobs_dir)
+            self.assertEqual(score_deep, 1.0)
+            self.assertEqual(path_deep, "verifier_result.rewards.reward")
+            self.assertIn("trial_01/result.json", src_deep)
+
+            # 5. Fallback to reward.txt when result.json has no valid rewards
+            trial_res_file.unlink()
+            job_res_file.write_text(json.dumps({"status": "partial"}), encoding="utf-8")
+            log_dir = trial_dir / "logs" / "verifier"
+            log_dir.mkdir(parents=True)
+            reward_txt = log_dir / "reward.txt"
+            reward_txt.write_text("1.0\n", encoding="utf-8")
+
+            score_txt, src_txt, path_txt = find_and_extract_harbor_reward(jobs_dir)
+            self.assertEqual(score_txt, 1.0)
+            self.assertEqual(path_txt, "filesystem:reward.txt")
 
 
 if __name__ == "__main__":

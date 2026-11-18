@@ -10,6 +10,7 @@ Zero untrusted code is executed on the host.
 
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -603,3 +604,183 @@ def export_harbor_task_package(
         if zip_dest.exists():
             zip_dest.unlink(missing_ok=True)
         raise
+
+
+# ── Reward Protocol & Result Extraction Helpers ───────────────────────
+
+def parse_finite_numeric_reward(val: object) -> float | None:
+    """Parses and validates a candidate reward value as a finite float.
+
+    Rejects None, booleans, non-numeric strings, NaN, and +/- Infinity.
+    Preserves 0.0 without treating it as falsy or missing.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if math.isfinite(val) else None
+    if isinstance(val, str):
+        try:
+            parsed = float(val.strip())
+            return parsed if math.isfinite(parsed) else None
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def extract_harbor_reward(data: object) -> tuple[float | None, str]:
+    """Extracts the numeric verifier reward score from a Harbor evaluation result structure.
+
+    Supports:
+    - JobResult structures with 'trial_results' or 'trials' lists
+    - TrialResult structures with 'verifier_result' or 'rewards' dictionaries
+    - Direct reward scalar or labeled metric dictionaries
+    - Strict validation: rejects null, boolean, NaN, Inf, and non-numeric values
+
+    Returns:
+        tuple[float | None, str]: (reward_score, matched_key_path_or_reason)
+    """
+    if not isinstance(data, (dict, list)):
+        return None, "Invalid result data: expected dict or list"
+
+    def _inspect_trial_dict(trial: dict, prefix: str) -> tuple[float | None, str]:
+        # 1. Inspect verifier_result
+        if "verifier_result" in trial:
+            v_res = trial.get("verifier_result")
+            v_prefix = f"{prefix}.verifier_result" if prefix else "verifier_result"
+            if isinstance(v_res, dict):
+                # 1a. v_res["rewards"]
+                rewards = v_res.get("rewards")
+                if isinstance(rewards, dict):
+                    # Check standard expected keys
+                    for k in ("reward", "default", "score", "accuracy", "correctness"):
+                        if k in rewards:
+                            score = parse_finite_numeric_reward(rewards[k])
+                            if score is not None:
+                                return score, f"{v_prefix}.rewards.{k}"
+                    # If single-entry mapping, extract that metric
+                    if len(rewards) == 1:
+                        k = next(iter(rewards))
+                        score = parse_finite_numeric_reward(rewards[k])
+                        if score is not None:
+                            return score, f"{v_prefix}.rewards.{k}"
+                    # Check any other numeric key
+                    for k, v in rewards.items():
+                        score = parse_finite_numeric_reward(v)
+                        if score is not None:
+                            return score, f"{v_prefix}.rewards.{k}"
+                elif rewards is not None:
+                    score = parse_finite_numeric_reward(rewards)
+                    if score is not None:
+                        return score, f"{v_prefix}.rewards"
+
+                # 1b. v_res["reward"] directly
+                if "reward" in v_res:
+                    score = parse_finite_numeric_reward(v_res.get("reward"))
+                    if score is not None:
+                        return score, f"{v_prefix}.reward"
+
+        # 2. Inspect rewards at trial root
+        if "rewards" in trial:
+            rewards = trial.get("rewards")
+            r_prefix = f"{prefix}.rewards" if prefix else "rewards"
+            if isinstance(rewards, dict):
+                for k in ("reward", "default", "score"):
+                    if k in rewards:
+                        score = parse_finite_numeric_reward(rewards[k])
+                        if score is not None:
+                            return score, f"{r_prefix}.{k}"
+                if len(rewards) == 1:
+                    k = next(iter(rewards))
+                    score = parse_finite_numeric_reward(rewards[k])
+                    if score is not None:
+                        return score, f"{r_prefix}.{k}"
+            elif rewards is not None:
+                score = parse_finite_numeric_reward(rewards)
+                if score is not None:
+                    return score, r_prefix
+
+        # 3. Inspect reward scalar at trial root
+        if "reward" in trial:
+            score = parse_finite_numeric_reward(trial.get("reward"))
+            if score is not None:
+                return score, f"{prefix}.reward" if prefix else "reward"
+
+        return None, f"No numeric reward found under {prefix or 'trial'}"
+
+    # Handle list of trials directly
+    if isinstance(data, list):
+        for idx, item in enumerate(data):
+            if isinstance(item, dict):
+                score, path = _inspect_trial_dict(item, f"[{idx}]")
+                if score is not None:
+                    return score, path
+        return None, "No valid numeric reward found in trial list"
+
+    # Handle JobResult (contains 'trial_results' or 'trials')
+    for trials_key in ("trial_results", "trials"):
+        if trials_key in data:
+            trials = data.get(trials_key)
+            if isinstance(trials, list):
+                for idx, trial in enumerate(trials):
+                    if isinstance(trial, dict):
+                        score, path = _inspect_trial_dict(trial, f"{trials_key}[{idx}]")
+                        if score is not None:
+                            return score, path
+
+    # Handle TrialResult directly
+    score, path = _inspect_trial_dict(data, "")
+    if score is not None:
+        return score, path
+
+    return None, "No valid numeric verifier reward found in result structure"
+
+
+def find_and_extract_harbor_reward(jobs_dir: Path | str) -> tuple[float | None, str, str]:
+    """Scans a Harbor jobs directory for result.json or reward files and extracts the reward.
+
+    Inspects trial-level results, job-level summaries, and log artifacts in order of specificity.
+
+    Returns:
+        tuple[float | None, str, str]: (score, file_source_path, matched_path_or_reason)
+    """
+    jobs_path = Path(jobs_dir)
+    if not jobs_path.exists():
+        return None, "", f"Jobs directory does not exist: {jobs_path}"
+
+    # 1. Search all result.json files, ordering deeper paths (trial results) before job summaries
+    result_files = sorted(jobs_path.glob("**/result.json"), key=lambda p: len(p.parts), reverse=True)
+    for res_file in result_files:
+        try:
+            content = res_file.read_text(encoding="utf-8")
+            data = json.loads(content)
+            score, key_path = extract_harbor_reward(data)
+            if score is not None:
+                return score, str(res_file).replace("\\", "/"), key_path
+        except Exception:
+            continue
+
+    # 2. Check for reward.json artifacts in logs
+    reward_json_files = sorted(jobs_path.glob("**/reward.json"), key=lambda p: len(p.parts), reverse=True)
+    for r_json in reward_json_files:
+        try:
+            content = r_json.read_text(encoding="utf-8")
+            data = json.loads(content)
+            if isinstance(data, dict):
+                score, key_path = extract_harbor_reward({"rewards": data})
+                if score is not None:
+                    return score, str(r_json).replace("\\", "/"), f"reward.json:{key_path}"
+        except Exception:
+            continue
+
+    # 3. Check for reward.txt artifacts in logs
+    reward_txt_files = sorted(jobs_path.glob("**/reward.txt"), key=lambda p: len(p.parts), reverse=True)
+    for r_txt in reward_txt_files:
+        try:
+            val_str = r_txt.read_text(encoding="utf-8").strip()
+            score = parse_finite_numeric_reward(val_str)
+            if score is not None:
+                return score, str(r_txt).replace("\\", "/"), "filesystem:reward.txt"
+        except Exception:
+            continue
+
+    return None, "", "No valid numeric verifier reward found across jobs directory"

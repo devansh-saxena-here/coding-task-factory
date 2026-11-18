@@ -95,67 +95,7 @@ jobs:
         id: verify-reward
         run: |
           echo "=== Inspecting Harbor Evaluation Results & Reward Score ==="
-          python - << 'EOF'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          jobs_dir = Path("harbor_jobs")
-          result_files = list(jobs_dir.glob("**/result.json"))
-
-          def record_output(score):
-              gh_out = os.environ.get("GITHUB_OUTPUT")
-              if gh_out and os.path.exists(gh_out):
-                  with open(gh_out, "a", encoding="utf-8") as out:
-                      out.write(f"reward_score={score}\n")
-
-          if not result_files:
-              print(f"ERROR: No result.json found under {jobs_dir.resolve()}", file=sys.stderr)
-              # Check if reward.txt exists anywhere in logs
-              reward_files = list(jobs_dir.glob("**/reward.txt"))
-              if reward_files:
-                  print(f"Found reward.txt at: {reward_files[0]}")
-                  val = reward_files[0].read_text().strip()
-                  print(f"Reward value: {val}")
-                  if float(val) == 1.0:
-                      record_output("1.0")
-                      print("REWARD_VERIFIED=1.0")
-                      sys.exit(0)
-              sys.exit(1)
-
-          latest_result = result_files[0]
-          print(f"Examining trial result: {latest_result}")
-          with open(latest_result, "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          # Extract reward score from Harbor result structure
-          reward = None
-          if "verifier_result" in data:
-              v_res = data["verifier_result"]
-              if isinstance(v_res, dict):
-                  rewards = v_res.get("rewards", {})
-                  if isinstance(rewards, dict):
-                      reward = rewards.get("reward")
-                  elif isinstance(rewards, (int, float)):
-                      reward = rewards
-          if reward is None and "reward" in data:
-              reward = data.get("reward")
-
-          print(f"Recorded Reward Score: {reward}")
-
-          if reward is None:
-              print("ERROR: Reward score could not be determined from result.json", file=sys.stderr)
-              sys.exit(1)
-
-          record_output(str(reward))
-
-          if float(reward) != 1.0:
-              print(f"ERROR: Oracle verification failed. Expected reward 1.0, got {reward}", file=sys.stderr)
-              sys.exit(1)
-
-          print("SUCCESS: Oracle evaluation verified with reward 1.0.")
-          EOF
+          python backend/scripts/verify_harbor_reward.py --jobs-dir ./harbor_jobs --expected-reward 1.0
 
       - name: Generate Job Execution Summary
         if: always()
